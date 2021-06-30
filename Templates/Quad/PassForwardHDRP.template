@@ -1,0 +1,133 @@
+// Forward pass
+Pass
+{		
+	Name "ForwardUnlit"
+	Tags { "LightMode" = "Forward" }
+	
+	HLSLPROGRAM
+	#pragma target 4.5
+	
+	struct ps_input
+	{
+		float4 pos : SV_POSITION;
+		#if USE_FLIPBOOK_INTERPOLATION
+		float4 uv : TEXCOORD0;
+		#else
+		float2 uv : TEXCOORD0;	
+		#endif
+		#if VFX_NEEDS_COLOR_INTERPOLATOR
+		nointerpolation float4 color : COLOR0;
+		#endif
+		#if USE_SOFT_PARTICLE || USE_ALPHA_TEST || USE_FLIPBOOK_INTERPOLATION || COLORMODE_GRADIENTMAP
+		// x: inverse soft particles fade distance
+		// y: alpha threshold
+		// z: frame blending factor
+		// w: TemperatureScale
+		nointerpolation float4 builtInInterpolants : TEXCOORD1;
+		#endif
+		#if USE_SOFT_PARTICLE
+		float4 projPos : TEXCOORD2;		
+		#endif
+		// #if VFX_NEEDS_WORLDPOS
+		float3 worldPos : TEXCOORD3;
+		// #endif
+	};
+	
+	struct ps_output
+	{
+		float4 color : SV_Target0;
+	};
+
+#define VFX_VARYING_PS_INPUTS ps_input
+#define VFX_VARYING_POSCS pos
+#define VFX_VARYING_POSSS projPos
+#define VFX_VARYING_COLOR color.rgb
+#define VFX_VARYING_ALPHA color.a
+#define VFX_VARYING_INVSOFTPARTICLEFADEDISTANCE builtInInterpolants.x
+#define VFX_VARYING_ALPHATHRESHOLD builtInInterpolants.y
+#define VFX_VARYING_FRAMEBLEND builtInInterpolants.z
+#define VFX_VARYING_UV uv
+		
+
+	${VFXBegin:VFXVertexAdditionalProcess}
+#if COLORMODE_GRADIENTMAP
+							${VFXLoadParameter:{temperatureScale}}
+							o.builtInInterpolants.w = temperatureScale;
+#if GRADIENTMAP_SOURCE_TEMPERATURE
+							o.builtInInterpolants.w *= temperature; // we premultiply temperature attribute in the interpolant
+#endif
+#endif
+
+#ifdef VFX_WORLD_SPACE
+	o.worldPos = vPos;
+#else
+	o.worldPos = mul(VFXGetObjectToWorldMatrix(), float4(vPos,1)).xyz;
+#endif
+	${VFXEnd}
+	
+	${VFXInclude("Shaders/ParticleQuads/Pass.template")}
+
+	#pragma fragment frag
+	ps_output frag(ps_input i)
+	{
+		// HDRP PositionInputs for softparticles and fog
+		PositionInputs posInput = GetPositionInput(i.pos.xy, _ScreenSize.zw, i.pos.z, i.pos.w, i.worldPos);
+		ps_output o = (ps_output)0;
+		
+		o.color = 1.0f;
+
+		float4 particleColor =VFXGetParticleColor(i);
+		float4 texColor = VFXGetTextureColor(VFX_SAMPLER(mainTexture),i);
+		float fade = VFXGetSoftParticleFade(i);
+
+#if COLORMODE_TEXTURERGBA
+		o.color *= texColor;
+#elif COLORMODE_TEXTUREALPHA
+		o.color.a *= texColor.a;
+#elif COLORMODE_GRADIENTMAP
+		${VFXLoadParameter:{gradient}}
+
+	#if GRADIENTMAP_SOURCE_ALPHA
+			float temp = i.color.a;
+	#elif GRADIENTMAP_SOURCE_RGBLUMA
+			float temp = max(0.0,dot(i.color.rgb,float3(0.2126, 0.7152, 0.0722))); // fix later if not correct
+	#elif GRADIENTMAP_SOURCE_TEMPERATURE
+			float temp = 1.0; // we already premultiplied temperature attribute in i.builtInInterpolants.w
+	#endif
+
+
+	temp *= fade;
+	o.color *= SampleGradient(gradient,saturate(texColor.a * temp * i.builtInInterpolants.w));
+	o.color.rgb *= i.color.rgb * min(1.0f, texColor.a * temp);
+#endif
+
+		o.color *= particleColor;
+		o.color.a *= fade;
+
+		VFXClipFragmentColor(o.color.a, i);
+
+		// ensure alpha is always 0..1
+		o.color.a = saturate(o.color.a);
+
+		// finally, apply fog
+		//float4 fog = EvaluateAtmosphericScattering(posInput);
+
+		#if BLENDMODE_ALPHA
+		// Regular alpha blend need to multiply fog color by opacity (as we do src * src_a inside the shader)
+		//o.color.rgb = lerp(o.color.rgb, fog.rgb , fog.a);
+
+		#elif BLENDMODE_MASKED
+		// Regular alpha blend need to multiply fog color by opacity (as we do src * src_a inside the shader)
+		//o.color.rgb = lerp(o.color.rgb, fog.rgb * o.color.a, fog.a);
+		#elif BLENDMODE_ADDITIVE
+		// For additive, we just need to fade to black with fog density (black + background == background color == fog color)
+		//o.color.rgb = o.color.rgb * (1.0 - fog.a);
+		#elif BLENDMODE_ALPHA_PREMULTIPLIED
+		// For Pre-Multiplied Alpha Blend, we need to multiply fog color by src alpha to match regular alpha blending formula.
+		//o.color.rgb = lerp(o.color.rgb, fog.rgb * o.color.a, fog.a);
+		#endif
+
+		return o;
+	}
+	ENDHLSL
+}
